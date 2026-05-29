@@ -304,7 +304,7 @@ class DNSBenchmark:
 
             # Lookup hop locations in parallel to avoid sequential 0.3s sleeps
             def lookup_hop(hop: Dict[str, Any]) -> None:
-                if self.is_valid_ip(hop["ip"]):
+                if self.is_valid_ip(hop["ip"]) and not self.is_private_ip(hop["ip"]):
                     hop["location"] = self.get_dns_server_location(hop["ip"])
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(hops) or 1)) as hop_pool:
