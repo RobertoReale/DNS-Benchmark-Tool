@@ -19,6 +19,7 @@ import subprocess
 import json
 import statistics
 import re
+import threading
 from collections import defaultdict
 from typing import Dict, List, Optional, Any, Union
 
@@ -41,10 +42,16 @@ except ImportError:
                          "dnspython", "requests", "matplotlib", 
                          "numpy", "folium", "rich"])
     print("Libraries installed successfully. Restarting script...")
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    # os.execv is unreliable on Windows; spawn a new process and exit cleanly instead
+    result = subprocess.call([sys.executable] + sys.argv)
+    sys.exit(result)
 
 # Initialize console for rich output
 console = Console()
+
+# Global rate limiter: max 1 ipinfo.io request every 0.3s across all threads
+_geo_lock = threading.Lock()
+_geo_last_call: float = 0.0
 
 class DNSBenchmark:
     def __init__(self) -> None:
@@ -181,12 +188,19 @@ class DNSBenchmark:
             return False
 
     def get_dns_server_location(self, ip: str) -> Dict[str, Any]:
-        """Get the geographic location of a DNS server with rate limiting"""
+        """Get the geographic location of a DNS server with global rate limiting"""
         if ip in self.locations:
             return self.locations[ip]
-            
+
+        global _geo_last_call
+        with _geo_lock:
+            now = time.time()
+            wait = 0.3 - (now - _geo_last_call)
+            if wait > 0:
+                time.sleep(wait)
+            _geo_last_call = time.time()
+
         try:
-            time.sleep(0.3) # Simple rate limit logic
             response = requests.get(f"https://ipinfo.io/{ip}/json", timeout=5)
             if response.status_code == 200:
                 data = response.json()
@@ -202,11 +216,10 @@ class DNSBenchmark:
                 self.locations[ip] = location
                 return location
             elif response.status_code == 429:
-                console.print(f"[yellow]Warning: Rate limited by ipinfo.io for IP {ip}.")
-                time.sleep(2.0)
+                console.print(f"[yellow]Warning: Rate limited by ipinfo.io for IP {ip}, skipping.")
         except Exception as e:
-            pass
-        
+            console.print(f"[yellow]Warning: Geo lookup failed for {ip}: {e}")
+
         default_location = {
             "ip": ip, "hostname": "Unknown", "city": "Unknown",
             "region": "Unknown", "country": "Unknown", "org": "Unknown", "loc": "0,0"
@@ -288,11 +301,15 @@ class DNSBenchmark:
                             hops.append({"hop": hop_num, "ip": hop_ip, "time": response_time})
             
             process.wait(timeout=60)
-            
-            for hop in hops:
+
+            # Lookup hop locations in parallel to avoid sequential 0.3s sleeps
+            def lookup_hop(hop: Dict[str, Any]) -> None:
                 if self.is_valid_ip(hop["ip"]):
                     hop["location"] = self.get_dns_server_location(hop["ip"])
-            
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(hops) or 1)) as hop_pool:
+                concurrent.futures.wait([hop_pool.submit(lookup_hop, h) for h in hops])
+
             return hops
             
         except subprocess.TimeoutExpired:
@@ -315,8 +332,8 @@ class DNSBenchmark:
             for record_type in ['A', 'AAAA', 'MX']:
                 query_times = []
                 records = []
-                status = "success"
-                
+                last_error_status = "success"
+
                 for _ in range(3):
                     query_result = self.query_dns(dns_server, domain, record_type)
                     if query_result["status"] == "success":
@@ -324,7 +341,9 @@ class DNSBenchmark:
                         if not records and query_result["records"]:
                             records = query_result["records"]
                     else:
-                        status = query_result["status"]
+                        last_error_status = query_result["status"]
+
+                status = "success" if query_times else last_error_status
                 
                 if query_times:
                     avg_time = statistics.mean(query_times)
@@ -394,7 +413,7 @@ class DNSBenchmark:
                 self.trace_results[provider][server] = trace
                 progress.advance(main_task, 1)
 
-            max_threads = min(10, len(tasks) if tasks else 1)
+            max_threads = min(20, len(tasks) if tasks else 1)
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
                 futures = [executor.submit(worker, p, s) for p, s in tasks]
                 concurrent.futures.wait(futures)
@@ -409,22 +428,24 @@ class DNSBenchmark:
             provider_times = []
             provider_success = 0
             provider_total = 0
-            
+
+            stats[provider] = {"servers": {}}
+
             for server, result in servers.items():
                 server_times = []
                 server_success = 0
                 server_total = 0
-                
-                for query, query_result in result["queries"].items():
+
+                for _, query_result in result["queries"].items():
                     if query_result["status"] == "success":
                         server_times.append(query_result["avg_time"])
                         server_success += 1
                         provider_times.append(query_result["avg_time"])
                         provider_success += 1
-                    
+
                     server_total += 1
                     provider_total += 1
-                
+
                 if server_times:
                     avg_time = statistics.mean(server_times)
                     min_time = min(server_times)
@@ -432,10 +453,7 @@ class DNSBenchmark:
                     reliability = (server_success / server_total) * 100
                 else:
                     avg_time = min_time = max_time = reliability = 0
-                
-                if provider not in stats:
-                    stats[provider] = {"servers": {}}
-                
+
                 stats[provider]["servers"][server] = {
                     "avg_time": avg_time, "min_time": min_time, "max_time": max_time,
                     "reliability": reliability, "success": server_success, "total": server_total
@@ -522,11 +540,17 @@ class DNSBenchmark:
         """Display a recommendation based on the benchmark results"""
         best_provider = None
         best_score = float('inf')
-        
+
+        # Normalize avg_time to 0-1 so speed and reliability are comparable
+        all_times = [stats[p]["avg_time"] for p in sorted_providers if stats[p]["avg_time"] > 0]
+        max_time = max(all_times) if all_times else 1.0
+
         for provider in sorted_providers:
             provider_stats = stats[provider]
             if provider_stats["avg_time"] > 0:
-                score = (provider_stats["avg_time"] * 0.8) - (provider_stats["reliability"] * 0.2)
+                norm_time = provider_stats["avg_time"] / max_time
+                norm_unreliability = 1.0 - (provider_stats["reliability"] / 100.0)
+                score = norm_time * 0.7 + norm_unreliability * 0.3
                 if score < best_score:
                     best_score = score
                     best_provider = provider
@@ -592,6 +616,7 @@ class DNSBenchmark:
         plt.savefig(filename)
         console.print(f"[green]Response time chart saved as: {filename}")
         plt.show()
+        plt.close()
 
     def create_traceroute_map(self) -> None:
         """Create an interactive map showing the traceroute paths"""
@@ -678,7 +703,7 @@ class DNSBenchmark:
                             server_lat = float(server_lat)
                             server_lon = float(server_lon)
                         except ValueError:
-                            continue
+                            continue  # skip to next server in the outer for-server loop
                         
                         if not self.is_private_ip(server) and not (server_lat == 0.0 and server_lon == 0.0):
                             folium.PolyLine(
